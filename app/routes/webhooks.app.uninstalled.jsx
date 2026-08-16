@@ -1,16 +1,18 @@
 import { authenticate } from "../shopify.server";
-import db from "../db.server";
+import { purgeShopData, recordWebhookOnce } from "../services/tenant.server";
 
 export const action = async ({ request }) => {
-  const { shop, session, topic } = await authenticate.webhook(request);
+  const { shop, topic } = await authenticate.webhook(request);
+  const eventId = request.headers.get("x-shopify-webhook-id");
 
   console.log(`Received ${topic} webhook for ${shop}`);
 
-  // Webhook requests can trigger multiple times and after an app has already been uninstalled.
-  // If this webhook already ran, the session may have been deleted previously.
-  if (session) {
-    await db.session.deleteMany({ where: { shop } });
-  }
+  // Shopify can redeliver webhooks; process each unique delivery once.
+  const fresh = await recordWebhookOnce({ shop, topic, eventId });
+  if (!fresh) return new Response();
+
+  // Remove every tenant-scoped row for this shop (sessions included).
+  await purgeShopData(shop);
 
   return new Response();
 };

@@ -71,15 +71,24 @@ Full phase details live in [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md).
 - ⬜ (later) email channel, per-bucket / frequency preferences, mute
 - ⚠️ Teams webhooks need a work/school (org) tenant — personal "Communities" don't support them; Slack works on any account
 
+## Phase 7 — Multi-tenancy, security & reliability 🟡
+
+- ✅ **Isolation test** — proves recompute/queries touch only the target shop (`tenant.test.js`)
+- ✅ **Uninstall data purge** — `app/uninstalled` deletes every tenant-scoped row (also = GDPR shop redact)
+- ✅ **Webhook idempotency** — `recordWebhookOnce` dedups redelivered webhooks
+- ✅ **Health check** route `/healthz` (process + DB ping) for uptime monitors
+- ✅ Every DB query is `shop`-scoped (audited); `session.shop` comes from the verified session
+- ⬜ Structured logging / error monitoring (currently console)
+- ⬜ Load-test large catalog (10k–100k products) + bulk operations
+- ⬜ GDPR customer webhooks (`customers/data_request`, `customers/redact`) → App Store (Phase 9)
+
 ---
 
 ## Cross-cutting / not yet started
-- ⬜ Multi-tenant **isolation test** → Phase 7
 - ⬜ Billing (8), App Store launch (9)
 
 ## Recommended next order
 
 1. **Phase 2 webhooks** + `incremental-sync` → auto-fresh data (no manual "Sync now")
 2. **Scheduled daily job** + rate-limit backoff → finishes Phase 3
-3. **Phase 6 notifications** → alert when an item turns high-risk
-4. Postgres switch (Phase 1) before any real deployment
+3. Postgres switch (Phase 1) before any real deployment
