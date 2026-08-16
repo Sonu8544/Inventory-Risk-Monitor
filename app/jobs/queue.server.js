@@ -6,6 +6,7 @@ import { syncInventory, syncSales } from "../services/sync.server";
 import { recomputeRisk } from "../services/risk.server";
 import { getShopSettings } from "../services/settings.server";
 import { sendHighRiskAlert } from "../services/notify.server";
+import { isPro } from "../services/billing.server";
 
 // -----------------------------------------------------------------------------
 // Background processing (Phase 3).
@@ -83,8 +84,12 @@ async function processJob(job) {
     // sync if the notification channel is down.
     let notified = 0;
     if (newlyHighRisk.length) {
-      const settings = await getShopSettings(shop);
-      if (settings.notify?.enabled && settings.notify?.webhookUrl) {
+      // Automated alerts are a Pro feature (Phase 8 gating).
+      const [settings, pro] = await Promise.all([
+        getShopSettings(shop),
+        isPro(shop),
+      ]);
+      if (pro && settings.notify?.enabled && settings.notify?.webhookUrl) {
         try {
           await sendHighRiskAlert({
             webhookUrl: settings.notify.webhookUrl,

@@ -82,13 +82,22 @@ Full phase details live in [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md).
 - ⬜ Load-test large catalog (10k–100k products) + bulk operations
 - ⬜ GDPR customer webhooks (`customers/data_request`, `customers/redact`) → App Store (Phase 9)
 
+## Phase 8 — Billing ✅
+
+- ✅ Shopify **Billing API** — recurring "Pro" plan ($9.99/mo, 7-day free trial), test charges in dev
+- ✅ **Billing page** (`/app/billing`): status, start-trial (subscribe), cancel
+- ✅ `checkAndPersistPlan` writes `Shop.plan`; `isPro(shop)` used by the job (no API call)
+- ✅ **Freemium gate**: automated Slack/Teams alerts require Pro (test alert stays free)
+- ⬜ (later) `app_subscriptions/update` webhook to keep plan fresh; usage-based billing
+
 ---
 
 ## Cross-cutting / not yet started
-- ⬜ Billing (8), App Store launch (9)
+- ⬜ App Store launch (9)
 
 ## Recommended next order
 
 1. **Phase 2 webhooks** + `incremental-sync` → auto-fresh data (no manual "Sync now")
 2. **Scheduled daily job** + rate-limit backoff → finishes Phase 3
 3. Postgres switch (Phase 1) before any real deployment
+4. **Phase 9** App Store prep (GDPR webhooks, listing, review)

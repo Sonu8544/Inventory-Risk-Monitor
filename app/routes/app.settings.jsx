@@ -66,6 +66,11 @@ export default function Settings() {
           <s-text type="strong">high-risk</s-text>. Paste your incoming webhook
           URL below — the channel is detected automatically.
         </s-paragraph>
+        <s-paragraph color="subdued">
+          Automated alerts require the{" "}
+          <s-link href="/app/billing">Pro plan</s-link>. You can still send a
+          test alert to verify the connection.
+        </s-paragraph>
 
         <Form method="post">
           <input type="hidden" name="intent" value="save" />
