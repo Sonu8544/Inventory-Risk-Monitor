@@ -5,30 +5,189 @@ generator client {
   provider = "prisma-client-js"
 }
 
-// Note that some adapters may set a maximum length for the String type by default, please ensure your strings are long
-// enough when changing adapters.
-// See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
+// -----------------------------------------------------------------------------
+// Datasource
+// Local dev uses SQLite (zero setup). For production multi-tenant, switch to:
+//   provider = "postgresql"
+//   url      = env("DATABASE_URL")
+// The models below are written to be portable to Postgres (no SQLite-only types).
+// -----------------------------------------------------------------------------
 datasource db {
   provider = "sqlite"
   url      = "file:dev.sqlite"
 }
 
+// -----------------------------------------------------------------------------
+// Auth session (managed by @shopify/shopify-app-session-storage-prisma).
+// Do not rename fields — the library expects this exact shape.
+// -----------------------------------------------------------------------------
 model Session {
-  id            String    @id
-  shop          String
-  state         String
-  isOnline      Boolean   @default(false)
-  scope         String?
-  expires       DateTime?
-  accessToken   String
-  userId        BigInt?
-  firstName     String?
-  lastName      String?
-  email         String?
-  accountOwner  Boolean   @default(false)
-  locale        String?
-  collaborator  Boolean?  @default(false)
-  emailVerified Boolean?  @default(false)
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
   refreshToken        String?
   refreshTokenExpires DateTime?
+}
+
+// =============================================================================
+// MULTI-TENANT DOMAIN MODELS
+// Tenant = a Shopify store, identified by its `shop` domain (e.g. "acme.myshopify.com").
+// EVERY row carries `shop`, and EVERY query MUST filter by `shop`.
+// This is the ONLY thing isolating one merchant's data from another — treat it
+// as a hard security boundary (see docs/DEVELOPMENT_PLAN.md, Phase 7).
+// =============================================================================
+
+// One installed store. Holds per-tenant settings and sync bookkeeping.
+model Shop {
+  id            String    @id @default(cuid())
+  shop          String    @unique
+  installedAt   DateTime  @default(now())
+  uninstalledAt DateTime?
+  plan          String? // billing plan key, null = free/trial
+  // Per-shop settings (thresholds, notification prefs) as JSON string.
+  settings      String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+// A Shopify location (warehouse/store) inventory is tracked against.
+model Location {
+  id                String   @id @default(cuid())
+  shop              String
+  shopifyLocationId String
+  name              String
+  active            Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@unique([shop, shopifyLocationId])
+  @@index([shop])
+}
+
+// Mirror of a Shopify product.
+model Product {
+  id               String    @id @default(cuid())
+  shop             String
+  shopifyProductId String
+  title            String
+  handle           String?
+  status           String? // ACTIVE / DRAFT / ARCHIVED
+  productType      String?
+  vendor           String?
+  shopifyCreatedAt DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  variants Variant[]
+
+  @@unique([shop, shopifyProductId])
+  @@index([shop])
+}
+
+// Mirror of a Shopify product variant — the unit we score.
+model Variant {
+  id               String    @id @default(cuid())
+  shop             String
+  shopifyVariantId String
+  productId        String
+  product          Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  sku              String?
+  title            String?
+  price            Decimal?
+  shopifyCreatedAt DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  inventoryLevels InventoryLevel[]
+  salesDaily      SalesDaily[]
+  riskScore       RiskScore?
+
+  @@unique([shop, shopifyVariantId])
+  @@index([shop])
+  @@index([productId])
+}
+
+// Available quantity of a variant at a location (from inventory_levels).
+model InventoryLevel {
+  id         String   @id @default(cuid())
+  shop       String
+  variantId  String
+  variant    Variant  @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  locationId String // references Location.shopifyLocationId
+  available  Int      @default(0)
+  updatedAt  DateTime @updatedAt
+
+  @@unique([shop, variantId, locationId])
+  @@index([shop])
+  @@index([variantId])
+}
+
+// Per-variant daily units sold, rolled up from orders. Drives sales velocity.
+model SalesDaily {
+  id        String   @id @default(cuid())
+  shop      String
+  variantId String
+  variant   Variant  @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  date      DateTime // day bucket (midnight UTC)
+  unitsSold Int      @default(0)
+
+  @@unique([shop, variantId, date])
+  @@index([shop])
+  @@index([variantId])
+}
+
+// Latest risk classification for a variant (output of the risk engine).
+model RiskScore {
+  id         String   @id @default(cuid())
+  shop       String
+  variantId  String   @unique
+  variant    Variant  @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  // Bucket: "HIGH_RISK" | "NEEDS_ATTENTION" | "HEALTHY" | "NOT_ENOUGH_DATA"
+  bucket     String
+  score      Float    @default(0)
+  // Human-readable reasons behind the flag, as a JSON string array.
+  reasons    String?
+  computedAt DateTime @default(now())
+
+  @@index([shop])
+  @@index([shop, bucket])
+}
+
+// Idempotency log so a redelivered webhook is processed at most once.
+model WebhookEvent {
+  id         String   @id @default(cuid())
+  shop       String
+  topic      String
+  eventId    String // Shopify's X-Shopify-Webhook-Id
+  receivedAt DateTime @default(now())
+
+  @@unique([topic, eventId])
+  @@index([shop])
+}
+
+// Per-shop, per-resource sync bookkeeping (pagination cursor, status).
+model SyncState {
+  id           String    @id @default(cuid())
+  shop         String
+  resource     String // "products" | "inventory" | "orders"
+  cursor       String?
+  status       String    @default("idle") // idle | running | error | done
+  lastSyncedAt DateTime?
+  error        String?
+  updatedAt    DateTime  @updatedAt
+
+  @@unique([shop, resource])
+  @@index([shop])
 }

@@ -1,337 +1,258 @@
 import { useEffect } from "react";
-import { useFetcher } from "react-router";
+import {
+  useFetcher,
+  useLoaderData,
+  useNavigate,
+  useRevalidator,
+  useRouteError,
+} from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
+import prisma from "../db.server";
+import { enqueueFullSync } from "../jobs/queue.server";
+import { BUCKET, BUCKET_META, BUCKET_ORDER } from "../services/risk-buckets";
+
+function safeParse(json) {
+  try {
+    return json ? JSON.parse(json) : [];
+  } catch {
+    return [];
+  }
+}
 
 export const loader = async ({ request }) => {
-  await authenticate.admin(request);
+  const { session } = await authenticate.admin(request);
+  const shop = session.shop;
 
-  return null;
-};
+  // Filter: "FLAGGED" (default) = everything except healthy; "ALL"; or a bucket.
+  const activeBucket = new URL(request.url).searchParams.get("bucket") || "FLAGGED";
+  const listWhere = { shop };
+  if (activeBucket === "FLAGGED") listWhere.bucket = { not: BUCKET.HEALTHY };
+  else if (activeBucket !== "ALL") listWhere.bucket = activeBucket;
 
-export const action = async ({ request }) => {
-  const { admin } = await authenticate.admin(request);
-  const color = ["Red", "Orange", "Yellow", "Green"][
-    Math.floor(Math.random() * 4)
-  ];
-  const response = await admin.graphql(
-    `#graphql
-      mutation populateProduct($product: ProductCreateInput!) {
-        productCreate(product: $product) {
-          product {
-            id
-            title
-            handle
-            status
-            variants(first: 10) {
-              edges {
-                node {
-                  id
-                  price
-                  barcode
-                  createdAt
-                }
-              }
-            }
-            demoInfo: metafield(namespace: "$app", key: "demo_info") {
-              jsonValue
-            }
-          }
-        }
-      }`,
-    {
-      variables: {
-        product: {
-          title: `${color} Snowboard`,
-          metafields: [
-            {
-              namespace: "$app",
-              key: "demo_info",
-              value: "Created by React Router Template",
-            },
-          ],
-        },
-      },
-    },
-  );
-  const responseJson = await response.json();
-  const product = responseJson.data.productCreate.product;
-  const variantId = product.variants.edges[0].node.id;
-  const variantResponse = await admin.graphql(
-    `#graphql
-    mutation shopifyReactRouterTemplateUpdateVariant($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
-      productVariantsBulkUpdate(productId: $productId, variants: $variants) {
-        productVariants {
-          id
-          price
-          barcode
-          createdAt
-        }
-      }
-    }`,
-    {
-      variables: {
-        productId: product.id,
-        variants: [{ id: variantId, price: "100.00" }],
-      },
-    },
-  );
-  const variantResponseJson = await variantResponse.json();
-  const metaobjectResponse = await admin.graphql(
-    `#graphql
-    mutation shopifyReactRouterTemplateUpsertMetaobject($handle: MetaobjectHandleInput!, $values: JSON!) {
-      metaobjectUpsert(handle: $handle, values: $values) {
-        metaobject {
-          id
-          handle
-          values
-        }
-        userErrors {
-          field
-          message
-        }
-      }
-    }`,
-    {
-      variables: {
-        handle: {
-          type: "$app:example",
-          handle: "demo-entry",
-        },
-        values: {
-          title: "Demo Entry",
-          description:
-            "This metaobject was created by the Shopify app template to demonstrate the metaobject API.",
-        },
-      },
-    },
-  );
-  const metaobjectResponseJson = await metaobjectResponse.json();
+  const [grouped, items, syncState] = await Promise.all([
+    prisma.riskScore.groupBy({
+      by: ["bucket"],
+      where: { shop },
+      _count: { bucket: true },
+    }),
+    prisma.riskScore.findMany({
+      where: listWhere,
+      orderBy: { score: "desc" },
+      take: 100,
+      include: { variant: { include: { product: true } } },
+    }),
+    prisma.syncState.findUnique({
+      where: { shop_resource: { shop, resource: "products" } },
+    }),
+  ]);
+
+  const counts = Object.fromEntries(BUCKET_ORDER.map((b) => [b, 0]));
+  for (const row of grouped) counts[row.bucket] = row._count.bucket;
+
+  const flagged = items.map((r) => ({
+    id: r.id,
+    variantId: r.variantId,
+    bucket: r.bucket,
+    score: r.score,
+    reasons: safeParse(r.reasons),
+    productTitle: r.variant?.product?.title ?? "Unknown product",
+    variantTitle: r.variant?.title ?? null,
+    sku: r.variant?.sku ?? null,
+  }));
 
   return {
-    product: responseJson.data.productCreate.product,
-    variant: variantResponseJson.data.productVariantsBulkUpdate.productVariants,
-    metaobject: metaobjectResponseJson.data.metaobjectUpsert.metaobject,
+    counts,
+    flagged,
+    lastSyncedAt: syncState?.lastSyncedAt ?? null,
+    hasData: grouped.length > 0,
+    syncStatus: syncState?.status ?? null,
+    syncError: syncState?.status === "error" ? syncState?.error : null,
+    activeBucket,
   };
 };
 
+export const action = async ({ request }) => {
+  const { session } = await authenticate.admin(request);
+  // Return fast: hand the heavy sync to the background worker (Phase 3).
+  const result = await enqueueFullSync(session.shop);
+  return { ok: true, ...result };
+};
+
+function variantLabel(item) {
+  const title =
+    item.variantTitle && item.variantTitle !== "Default Title"
+      ? item.variantTitle
+      : null;
+  if (title && item.sku) return `${title} (${item.sku})`;
+  if (title) return title;
+  if (item.sku) return item.sku;
+  return "—";
+}
+
+const FILTERS = [
+  { key: "FLAGGED", label: "Flagged" },
+  { key: "HIGH_RISK", label: "High risk" },
+  { key: "NEEDS_ATTENTION", label: "Needs attention" },
+  { key: "HEALTHY", label: "Healthy" },
+  { key: "NOT_ENOUGH_DATA", label: "Not enough data" },
+  { key: "ALL", label: "All" },
+];
+
 export default function Index() {
+  const {
+    counts,
+    flagged,
+    lastSyncedAt,
+    hasData,
+    syncStatus,
+    syncError,
+    activeBucket,
+  } = useLoaderData();
   const fetcher = useFetcher();
   const shopify = useAppBridge();
-  const isLoading =
+  const revalidator = useRevalidator();
+  const navigate = useNavigate();
+
+  // A sync is in-flight while the background job is queued or running.
+  const isRunning = syncStatus === "queued" || syncStatus === "running";
+  const isSubmitting =
     ["loading", "submitting"].includes(fetcher.state) &&
     fetcher.formMethod === "POST";
+  const isSyncing = isRunning || isSubmitting;
+
+  // Poll the loader every 2s while a sync is in progress so counts/flagged
+  // update live as the worker finishes.
+  useEffect(() => {
+    if (!isRunning) return;
+    const id = setInterval(() => {
+      if (revalidator.state === "idle") revalidator.revalidate();
+    }, 2000);
+    return () => clearInterval(id);
+  }, [isRunning, revalidator]);
 
   useEffect(() => {
-    if (fetcher.data?.product?.id) {
-      shopify.toast.show("Product created");
+    if (fetcher.data?.ok && fetcher.data.queued) {
+      shopify.toast.show("Sync started in the background…");
+    } else if (fetcher.data?.ok && fetcher.data.skipped) {
+      shopify.toast.show("A sync is already in progress");
     }
-  }, [fetcher.data?.product?.id, shopify]);
-  const generateProduct = () => fetcher.submit({}, { method: "POST" });
+  }, [fetcher.data, shopify]);
+
+  const runSync = () => fetcher.submit({}, { method: "POST" });
 
   return (
-    <s-page heading="Shopify app template">
-      <s-button slot="primary-action" onClick={generateProduct}>
-        Generate a product
+    <s-page heading="Inventory Risk Monitor">
+      <s-button
+        slot="primary-action"
+        onClick={runSync}
+        {...(isSyncing ? { loading: true } : {})}
+      >
+        {isSyncing ? "Syncing…" : "Sync now"}
       </s-button>
 
-      <s-section heading="Congrats on creating a new Shopify app 🎉">
-        <s-paragraph>
-          This embedded app template uses{" "}
-          <s-link
-            href="https://shopify.dev/docs/apps/tools/app-bridge"
-            target="_blank"
-          >
-            App Bridge
-          </s-link>{" "}
-          interface examples like an{" "}
-          <s-link href="/app/additional">additional page in the app nav</s-link>
-          , as well as an{" "}
-          <s-link
-            href="https://shopify.dev/docs/api/admin-graphql"
-            target="_blank"
-          >
-            Admin GraphQL
-          </s-link>{" "}
-          mutation demo, to provide a starting point for app development.
+      {syncError && (
+        <s-banner heading="Sync failed" tone="critical">
+          <s-paragraph>{syncError}</s-paragraph>
+        </s-banner>
+      )}
+
+      {isRunning && (
+        <s-banner heading="Sync in progress" tone="info">
+          <s-paragraph>
+            Pulling your store&apos;s inventory and scoring risk in the
+            background — this page updates automatically.
+          </s-paragraph>
+        </s-banner>
+      )}
+
+      <s-section heading="What needs my attention?">
+        <s-paragraph color="subdued">
+          {lastSyncedAt
+            ? `Last synced: ${new Date(lastSyncedAt).toLocaleString()}`
+            : "Not synced yet — click “Sync now” to pull your store's inventory."}
         </s-paragraph>
+
+        <s-grid gridTemplateColumns="1fr 1fr 1fr 1fr" gap="base">
+          {BUCKET_ORDER.map((b) => (
+            <s-box
+              key={b}
+              padding="base"
+              background="subdued"
+              borderRadius="base"
+            >
+              <s-stack direction="block" gap="base">
+                <s-heading>{counts[b] ?? 0}</s-heading>
+                <s-badge tone={BUCKET_META[b].tone}>
+                  {BUCKET_META[b].label}
+                </s-badge>
+              </s-stack>
+            </s-box>
+          ))}
+        </s-grid>
       </s-section>
-      <s-section heading="Get started with products">
-        <s-paragraph>
-          Generate a product with GraphQL and get the JSON output for that
-          product. Learn more about the{" "}
-          <s-link
-            href="https://shopify.dev/docs/api/admin-graphql/latest/mutations/productCreate"
-            target="_blank"
-          >
-            productCreate
-          </s-link>{" "}
-          mutation in our API references. Includes a product{" "}
-          <s-link
-            href="https://shopify.dev/docs/apps/build/custom-data/metafields"
-            target="_blank"
-          >
-            metafield
-          </s-link>{" "}
-          and{" "}
-          <s-link
-            href="https://shopify.dev/docs/apps/build/custom-data/metaobjects"
-            target="_blank"
-          >
-            metaobject
-          </s-link>
-          .
-        </s-paragraph>
-        <s-stack direction="inline" gap="base">
-          <s-button
-            onClick={generateProduct}
-            {...(isLoading ? { loading: true } : {})}
-          >
-            Generate a product
-          </s-button>
-          {fetcher.data?.product && (
+
+      <s-section heading="Flagged inventory">
+        <s-button-group>
+          {FILTERS.map((f) => (
             <s-button
-              onClick={() => {
-                shopify.intents.invoke?.("edit:shopify/Product", {
-                  value: fetcher.data?.product?.id,
-                });
-              }}
-              target="_blank"
-              variant="tertiary"
+              key={f.key}
+              variant={activeBucket === f.key ? "primary" : "tertiary"}
+              onClick={() =>
+                navigate(f.key === "FLAGGED" ? "/app" : `/app?bucket=${f.key}`)
+              }
             >
-              Edit product
+              {f.label}
             </s-button>
-          )}
-        </s-stack>
-        {fetcher.data?.product && (
-          <s-section heading="productCreate mutation">
-            <s-stack direction="block" gap="base">
-              <s-box
-                padding="base"
-                borderWidth="base"
-                borderRadius="base"
-                background="subdued"
-              >
-                <pre
-                  style={{
-                    margin: 0,
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-word",
-                  }}
-                >
-                  <code>{JSON.stringify(fetcher.data.product, null, 2)}</code>
-                </pre>
-              </s-box>
+          ))}
+        </s-button-group>
 
-              <s-heading>productVariantsBulkUpdate mutation</s-heading>
-              <s-box
-                padding="base"
-                borderWidth="base"
-                borderRadius="base"
-                background="subdued"
-              >
-                <pre
-                  style={{
-                    margin: 0,
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-word",
-                  }}
-                >
-                  <code>{JSON.stringify(fetcher.data.variant, null, 2)}</code>
-                </pre>
-              </s-box>
-
-              <s-heading>metaobjectUpsert mutation</s-heading>
-              <s-box
-                padding="base"
-                borderWidth="base"
-                borderRadius="base"
-                background="subdued"
-              >
-                <pre
-                  style={{
-                    margin: 0,
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-word",
-                  }}
-                >
-                  <code>
-                    {JSON.stringify(fetcher.data.metaobject, null, 2)}
-                  </code>
-                </pre>
-              </s-box>
-            </s-stack>
-          </s-section>
+        {!hasData && (
+          <s-paragraph>
+            No risk data yet. Click “Sync now” to analyze your inventory.
+          </s-paragraph>
         )}
-      </s-section>
-
-      <s-section slot="aside" heading="App template specs">
-        <s-paragraph>
-          <s-text>Framework: </s-text>
-          <s-link href="https://reactrouter.com/" target="_blank">
-            React Router
-          </s-link>
-        </s-paragraph>
-        <s-paragraph>
-          <s-text>Interface: </s-text>
-          <s-link
-            href="https://shopify.dev/docs/api/app-home/using-polaris-components"
-            target="_blank"
-          >
-            Polaris web components
-          </s-link>
-        </s-paragraph>
-        <s-paragraph>
-          <s-text>API: </s-text>
-          <s-link
-            href="https://shopify.dev/docs/api/admin-graphql"
-            target="_blank"
-          >
-            GraphQL
-          </s-link>
-        </s-paragraph>
-        <s-paragraph>
-          <s-text>Custom data: </s-text>
-          <s-link
-            href="https://shopify.dev/docs/apps/build/custom-data"
-            target="_blank"
-          >
-            Metafields &amp; metaobjects
-          </s-link>
-        </s-paragraph>
-        <s-paragraph>
-          <s-text>Database: </s-text>
-          <s-link href="https://www.prisma.io/" target="_blank">
-            Prisma
-          </s-link>
-        </s-paragraph>
-      </s-section>
-
-      <s-section slot="aside" heading="Next steps">
-        <s-unordered-list>
-          <s-list-item>
-            Build an{" "}
-            <s-link
-              href="https://shopify.dev/docs/apps/getting-started/build-app-example"
-              target="_blank"
-            >
-              example app
-            </s-link>
-          </s-list-item>
-          <s-list-item>
-            Explore Shopify&apos;s API with{" "}
-            <s-link
-              href="https://shopify.dev/docs/apps/tools/graphiql-admin-api"
-              target="_blank"
-            >
-              GraphiQL
-            </s-link>
-          </s-list-item>
-        </s-unordered-list>
+        {hasData && flagged.length === 0 && (
+          <s-paragraph>Nothing in this view.</s-paragraph>
+        )}
+        {flagged.length > 0 && (
+          <s-table variant="auto">
+            <s-table-header-row>
+              <s-table-header listSlot="primary">Product</s-table-header>
+              <s-table-header>Status</s-table-header>
+              <s-table-header>Variant / SKU</s-table-header>
+              <s-table-header>Reason</s-table-header>
+              <s-table-header>Details</s-table-header>
+            </s-table-header-row>
+            <s-table-body>
+              {flagged.map((item) => (
+                <s-table-row key={item.id}>
+                  <s-table-cell>{item.productTitle}</s-table-cell>
+                  <s-table-cell>
+                    <s-badge tone={BUCKET_META[item.bucket]?.tone}>
+                      {BUCKET_META[item.bucket]?.label}
+                    </s-badge>
+                  </s-table-cell>
+                  <s-table-cell>{variantLabel(item)}</s-table-cell>
+                  <s-table-cell>{item.reasons.join(" · ")}</s-table-cell>
+                  <s-table-cell>
+                    <s-link href={`/app/variants/${item.variantId}`}>
+                      View
+                    </s-link>
+                  </s-table-cell>
+                </s-table-row>
+              ))}
+            </s-table-body>
+          </s-table>
+        )}
       </s-section>
     </s-page>
   );
+}
+
+export function ErrorBoundary() {
+  return boundary.error(useRouteError());
 }
 
 export const headers = (headersArgs) => {
