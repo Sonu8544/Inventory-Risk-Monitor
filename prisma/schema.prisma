@@ -6,15 +6,14 @@ generator client {
 }
 
 // -----------------------------------------------------------------------------
-// Datasource
-// Local dev uses SQLite (zero setup). For production multi-tenant, switch to:
-//   provider = "postgresql"
-//   url      = env("DATABASE_URL")
-// The models below are written to be portable to Postgres (no SQLite-only types).
+// Datasource — PostgreSQL (production multi-tenant).
+// DATABASE_URL is provided by the host (Fly Postgres). For local dev, run a
+// Postgres (e.g. `docker run -e POSTGRES_PASSWORD=pass -p 5432:5432 postgres`)
+// and set DATABASE_URL accordingly.
 // -----------------------------------------------------------------------------
 datasource db {
-  provider = "sqlite"
-  url      = "file:dev.sqlite"
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 // -----------------------------------------------------------------------------

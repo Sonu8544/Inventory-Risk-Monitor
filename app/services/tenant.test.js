@@ -7,6 +7,11 @@ import { purgeShopData } from "./tenant.server";
 // Uses namespaced test shops in the dev DB and cleans them up, so it never
 // touches real store data — which is itself the property under test.
 
+// DB-backed integration test — needs a reachable Postgres (DATABASE_URL).
+// Skipped automatically when it isn't set (e.g. local without a DB).
+// eslint-disable-next-line no-undef
+const hasDb = Boolean(process.env.DATABASE_URL);
+
 const SHOP_A = "test-tenant-a.myshopify.com";
 const SHOP_B = "test-tenant-b.myshopify.com";
 
@@ -33,17 +38,19 @@ async function seedVariant(shop, { available, unitsSold }) {
 }
 
 beforeAll(async () => {
+  if (!hasDb) return;
   await purgeShopData(SHOP_A);
   await purgeShopData(SHOP_B);
 });
 
 afterAll(async () => {
+  if (!hasDb) return;
   await purgeShopData(SHOP_A);
   await purgeShopData(SHOP_B);
   await prisma.$disconnect();
 });
 
-describe("multi-tenant isolation", () => {
+describe.skipIf(!hasDb)("multi-tenant isolation", () => {
   it("recomputeRisk scores ONLY the target shop, never the other tenant", async () => {
     await seedVariant(SHOP_A, { available: 0, unitsSold: 60 }); // out of stock, selling
     await seedVariant(SHOP_B, { available: 50, unitsSold: 60 }); // healthy

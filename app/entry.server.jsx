@@ -4,6 +4,9 @@ import { ServerRouter } from "react-router";
 import { createReadableStreamFromReadable } from "@react-router/node";
 import { isbot } from "isbot";
 import { addDocumentResponseHeaders } from "./shopify.server";
+// Side-effect import: boots the in-process BullMQ worker + daily scheduler at
+// server startup (not lazily on first request), so background jobs run in prod.
+import "./jobs/queue.server";
 
 export const streamTimeout = 5000;
 
