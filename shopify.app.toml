@@ -2,7 +2,7 @@
 
 client_id = "595eb4a27542b172a006ea2e9a3f804b"
 name = "Inventory Risk Monitor"
-application_url = "https://example.com"
+application_url = "https://inventory-risk-monitor.onrender.com"
 embedded = true
 
 [access_scopes]
@@ -46,7 +46,11 @@ api_version = "2026-10"
   topics = [ "app_subscriptions/update" ]
 
 [auth]
-redirect_urls = [ "https://example.com/api/auth" ]
+redirect_urls = [
+  "https://inventory-risk-monitor.onrender.com/auth/callback",
+  "https://inventory-risk-monitor.onrender.com/auth/shopify/callback",
+  "https://inventory-risk-monitor.onrender.com/api/auth/callback",
+]
 
 [build]
 include_config_on_deploy = true
