@@ -52,7 +52,7 @@ if (!g.__inventoryQueue) g.__inventoryQueue = inventoryQueue;
  * @param {string} shop
  * @returns {Promise<{ queued: boolean, skipped?: boolean }>}
  */
-export async function enqueueFullSync(shop) {
+export async function enqueueFullSync(shop, { delayMs = 0 } = {}) {
   const state = await prisma.syncState.findUnique({
     where: { shop_resource: { shop, resource: "products" } },
   });
@@ -66,7 +66,13 @@ export async function enqueueFullSync(shop) {
     update: { status: "queued", error: null },
   });
 
-  await inventoryQueue.add("full-sync", { shop });
+  // A delay lets a burst of webhooks collapse into one sync (the SyncState
+  // "queued" flag above dedupes the rest of the burst).
+  await inventoryQueue.add(
+    "full-sync",
+    { shop },
+    delayMs ? { delay: delayMs } : {},
+  );
   return { queued: true };
 }
 
@@ -106,6 +112,14 @@ async function processJob(job) {
 
     return { synced, sales, tally, notified };
   }
+
+  if (job.name === "daily-sync-all") {
+    // Scheduled fan-out: enqueue a fresh sync for every installed shop.
+    const shops = await prisma.shop.findMany({ select: { shop: true } });
+    for (const s of shops) await enqueueFullSync(s.shop);
+    return { scheduled: shops.length };
+  }
+
   throw new Error(`Unknown job type: ${job.name}`);
 }
 
@@ -123,4 +137,17 @@ if (!g.__inventoryWorker) {
     console.error(`[worker] ${job?.name} failed:`, err?.message);
   });
   g.__inventoryWorker = worker;
+}
+
+// Scheduled daily re-score for every shop (Phase 3). Idempotent by scheduler id.
+if (!g.__inventoryScheduled) {
+  g.__inventoryScheduled = true;
+  inventoryQueue
+    .upsertJobScheduler(
+      "daily-sync-all",
+      { pattern: "0 3 * * *" }, // 03:00 every day
+      { name: "daily-sync-all", data: {} },
+    )
+    // eslint-disable-next-line no-console
+    .catch((e) => console.error("[scheduler] setup failed:", e?.message));
 }

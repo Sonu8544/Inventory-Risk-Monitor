@@ -25,8 +25,10 @@ Full phase details live in [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md).
 ## Phase 2 — Scopes & webhooks 🟡
 
 - ✅ Read scopes added: `read_products, read_inventory, read_locations, read_orders`
-- ⬜ Webhook subscriptions in `shopify.app.toml`: `products/create|update|delete`, `inventory_levels/update`, `orders/create`
-- ⬜ Webhook route handlers (`app/routes/webhooks.*`): HMAC verify → record in `WebhookEvent` (dedup) → enqueue job (no inline processing)
+- ✅ **Protected Customer Data (PCD) access** enabled in Partner Dashboard → API access requests → "Protected customer data" (base level only; needed to read the Order object for sales velocity). Without it, the orders query fails with "not approved to access the Order object".
+- ✅ App set to **Public distribution** (Dev Dashboard) — required by both the Billing API and PCD access
+- ✅ Webhook subscriptions in `shopify.app.toml`: `products/update`, `products/delete`, `inventory_levels/update`, `orders/create`, `app_subscriptions/update`, GDPR compliance
+- ✅ Webhook route handlers (`app/routes/webhooks.*`): HMAC verify → dedup (`WebhookEvent`) → enqueue debounced re-sync (no inline processing); `products/delete` prunes the product
 
 ## Phase 3 — Background processing 🟡 (foundation done)
 
@@ -36,10 +38,10 @@ Full phase details live in [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md).
 - ✅ Dedup (one sync per shop via `SyncState`) + retries (3× exponential backoff)
 - ✅ "Sync now" enqueues + UI polls status live (queued → running → done)
 - ✅ `rollup-sales` — orders → `SalesDaily` velocity (runs inside `full-sync`)
-- ⬜ `incremental-sync` job — apply webhook deltas (needs **Phase 2 webhooks**)
+- ✅ `incremental-sync` — product/inventory/order webhooks enqueue a debounced re-sync
+- ✅ Scheduled/repeatable job — `daily-sync-all` (BullMQ scheduler, 03:00 daily) re-syncs every shop
 - ⬜ Standalone `score` job (currently only runs inside `full-sync`)
 - ⬜ Rate-limit handling — read `throttleStatus`, dynamic backoff + retry w/ jitter (currently only reduced query cost)
-- ⬜ Scheduled/repeatable jobs — daily score + sales rollup per shop
 - ⬜ (Scale) Bulk Operations API for large catalogs instead of paginated queries
 - ⬜ (Prod) Extract Worker to a dedicated process/container
 
@@ -78,9 +80,9 @@ Full phase details live in [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md).
 - ✅ **Webhook idempotency** — `recordWebhookOnce` dedups redelivered webhooks
 - ✅ **Health check** route `/healthz` (process + DB ping) for uptime monitors
 - ✅ Every DB query is `shop`-scoped (audited); `session.shop` comes from the verified session
+- ✅ GDPR compliance webhooks (`customers/data_request`, `customers/redact`, `shop/redact`) — store no PII; `shop/redact` purges
 - ⬜ Structured logging / error monitoring (currently console)
 - ⬜ Load-test large catalog (10k–100k products) + bulk operations
-- ⬜ GDPR customer webhooks (`customers/data_request`, `customers/redact`) → App Store (Phase 9)
 
 ## Phase 8 — Billing ✅
 
@@ -88,7 +90,8 @@ Full phase details live in [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md).
 - ✅ **Billing page** (`/app/billing`): status, start-trial (subscribe), cancel
 - ✅ `checkAndPersistPlan` writes `Shop.plan`; `isPro(shop)` used by the job (no API call)
 - ✅ **Freemium gate**: automated Slack/Teams alerts require Pro (test alert stays free)
-- ⬜ (later) `app_subscriptions/update` webhook to keep plan fresh; usage-based billing
+- ✅ `app_subscriptions/update` webhook keeps `Shop.plan` fresh on subscribe/cancel
+- ⬜ (later) usage-based billing
 
 ---
 
